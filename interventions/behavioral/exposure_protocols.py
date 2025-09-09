@@ -1124,3 +1124,526 @@ class ExposureTherapyManager:
             created_date=datetime.fromisoformat(session_data[26]),
             therapist_notes=session_data[27] or ""
         )
+
+
+    def _get_protocol_by_id(self, protocol_id: str) -> Optional[ExposureProtocol]:
+        """Get exposure protocol by ID"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM exposure_protocols WHERE protocol_id = ?", (protocol_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return None
+            
+            return ExposureProtocol(
+                protocol_id=row[0],
+                name=row[1],
+                target_conditions=json.loads(row[2] or '[]'),
+                description=row[3],
+                typical_hierarchy_items=json.loads(row[4] or '[]'),
+                session_structure=json.loads(row[5] or '[]'),
+                safety_guidelines=json.loads(row[6] or '[]'),
+                contraindications=json.loads(row[7] or '[]'),
+                typical_session_duration=row[8],
+                sessions_per_week=row[9],
+                estimated_total_sessions=row[10],
+                adaptation_notes=row[11] or "",
+                prerequisite_skills=json.loads(row[12] or '[]'),
+                evidence_base=row[13] or ""
+            )
+
+    def _get_protocols_by_category(self, fear_category: str) -> List[ExposureProtocol]:
+        """Get protocols relevant to fear category"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM exposure_protocols WHERE is_default = TRUE")
+            rows = cursor.fetchall()
+            
+            protocols = []
+            for row in rows:
+                protocol = ExposureProtocol(
+                    protocol_id=row[0],
+                    name=row[1],
+                    target_conditions=json.loads(row[2] or '[]'),
+                    description=row[3],
+                    typical_hierarchy_items=json.loads(row[4] or '[]'),
+                    session_structure=json.loads(row[5] or '[]'),
+                    safety_guidelines=json.loads(row[6] or '[]'),
+                    contraindications=json.loads(row[7] or '[]'),
+                    typical_session_duration=row[8],
+                    sessions_per_week=row[9],
+                    estimated_total_sessions=row[10],
+                    adaptation_notes=row[11] or "",
+                    prerequisite_skills=json.loads(row[12] or '[]'),
+                    evidence_base=row[13] or ""
+                )
+                
+                # Check if protocol is relevant to fear category
+                if any(fear_category.lower() in condition.lower() for condition in protocol.target_conditions):
+                    protocols.append(protocol)
+            
+            return protocols
+
+    # ========================================================================
+    # PROGRESS ANALYSIS AND REPORTING
+    # ========================================================================
+
+    def generate_hierarchy_progress_report(self, hierarchy_id: str) -> Dict[str, Any]:
+        """Generate progress report for exposure hierarchy"""
+        hierarchy = self.get_exposure_hierarchy(hierarchy_id)
+        if not hierarchy:
+            return {"error": "Hierarchy not found"}
+        
+        # Get all sessions for this hierarchy
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT es.* FROM exposure_sessions es
+                JOIN exposure_items ei ON es.item_id = ei.item_id
+                WHERE ei.hierarchy_id = ? AND es.status = 'completed'
+                ORDER BY es.planned_date
+            """, (hierarchy_id,))
+            
+            session_data = cursor.fetchall()
+            sessions = [self._reconstruct_session(row) for row in session_data]
+        
+        # Calculate progress metrics
+        total_levels = len(hierarchy.exposure_items)
+        levels_mastered = len(hierarchy.levels_mastered)
+        completion_percentage = (levels_mastered / total_levels * 100) if total_levels > 0 else 0
+        
+        # Analyze anxiety trends
+        anxiety_trends = self._analyze_anxiety_trends(sessions)
+        
+        # Calculate session statistics
+        session_stats = self._calculate_session_statistics(sessions)
+        
+        # Identify patterns and recommendations
+        patterns = self._identify_exposure_patterns(hierarchy, sessions)
+        
+        report = {
+            "hierarchy_overview": {
+                "hierarchy_id": hierarchy.hierarchy_id,
+                "target_fear": hierarchy.target_fear,
+                "fear_category": hierarchy.fear_category,
+                "current_level": hierarchy.current_level,
+                "total_levels": total_levels,
+                "levels_mastered": levels_mastered,
+                "completion_percentage": round(completion_percentage, 1)
+            },
+            "session_statistics": session_stats,
+            "anxiety_trends": anxiety_trends,
+            "level_progress": [
+                {
+                    "level": item.difficulty_level,
+                    "description": item.description,
+                    "attempts": item.attempts,
+                    "successful_completions": item.successful_completions,
+                    "success_rate": round((item.successful_completions / item.attempts * 100) if item.attempts > 0 else 0, 1),
+                    "average_peak_anxiety": round(item.average_peak_anxiety, 1) if item.average_peak_anxiety else None,
+                    "average_end_anxiety": round(item.average_end_anxiety, 1) if item.average_end_anxiety else None,
+                    "mastered": item.difficulty_level in hierarchy.levels_mastered
+                }
+                for item in hierarchy.exposure_items
+            ],
+            "patterns_and_insights": patterns,
+            "recommendations": self._generate_exposure_recommendations(hierarchy, sessions, patterns)
+        }
+        
+        return report
+
+    def _analyze_anxiety_trends(self, sessions: List[ExposureSession]) -> Dict[str, Any]:
+        """Analyze anxiety trends across sessions"""
+        if not sessions:
+            return {}
+        
+        baseline_anxieties = [s.baseline_anxiety for s in sessions if s.baseline_anxiety is not None]
+        peak_anxieties = [s.peak_anxiety for s in sessions if s.peak_anxiety is not None]
+        end_anxieties = [s.end_anxiety for s in sessions if s.end_anxiety is not None]
+        
+        # Calculate habituation rates
+        habituation_rates = []
+        for session in sessions:
+            if session.peak_anxiety and session.end_anxiety:
+                rate = (session.peak_anxiety - session.end_anxiety) / session.peak_anxiety * 100
+                habituation_rates.append(rate)
+        
+        return {
+            "average_baseline_anxiety": round(sum(baseline_anxieties) / len(baseline_anxieties), 1) if baseline_anxieties else None,
+            "average_peak_anxiety": round(sum(peak_anxieties) / len(peak_anxieties), 1) if peak_anxieties else None,
+            "average_end_anxiety": round(sum(end_anxieties) / len(end_anxieties), 1) if end_anxieties else None,
+            "average_habituation_rate": round(sum(habituation_rates) / len(habituation_rates), 1) if habituation_rates else None,
+            "baseline_trend": "decreasing" if len(baseline_anxieties) > 1 and baseline_anxieties[-1] < baseline_anxieties[0] else "stable",
+            "sessions_with_good_habituation": len([r for r in habituation_rates if r >= 50])
+        }
+
+    def _calculate_session_statistics(self, sessions: List[ExposureSession]) -> Dict[str, Any]:
+        """Calculate session-level statistics"""
+        if not sessions:
+            return {}
+        
+        completed_sessions = len(sessions)
+        habituation_achieved = len([s for s in sessions if s.habituation_achieved])
+        premature_terminations = len([s for s in sessions if s.premature_termination])
+        
+        durations = [s.actual_duration for s in sessions if s.actual_duration]
+        avg_duration = sum(durations) / len(durations) if durations else None
+        
+        return {
+            "total_sessions_completed": completed_sessions,
+            "sessions_with_habituation": habituation_achieved,
+            "habituation_rate": round((habituation_achieved / completed_sessions * 100), 1) if completed_sessions > 0 else 0,
+            "premature_terminations": premature_terminations,
+            "completion_rate": round(((completed_sessions - premature_terminations) / completed_sessions * 100), 1) if completed_sessions > 0 else 0,
+            "average_session_duration": round(avg_duration, 1) if avg_duration else None
+        }
+
+    def _identify_exposure_patterns(self, hierarchy: ExposureHierarchy, sessions: List[ExposureSession]) -> List[str]:
+        """Identify patterns in exposure progress"""
+        patterns = []
+        
+        if not sessions:
+            return patterns
+        
+        # Check for consistent habituation
+        habituation_sessions = [s for s in sessions if s.habituation_achieved]
+        habituation_rate = len(habituation_sessions) / len(sessions)
+        
+        if habituation_rate > 0.8:
+            patterns.append("Consistent habituation pattern - excellent progress")
+        elif habituation_rate < 0.3:
+            patterns.append("Limited habituation - may need longer sessions or different approach")
+        
+        # Check for anxiety reduction over time
+        baseline_anxieties = [s.baseline_anxiety for s in sessions if s.baseline_anxiety is not None]
+        if len(baseline_anxieties) > 3:
+            recent_avg = sum(baseline_anxieties[-3:]) / 3
+            early_avg = sum(baseline_anxieties[:3]) / 3
+            if recent_avg < early_avg - 1:
+                patterns.append("Baseline anxiety decreasing over time - good generalization")
+        
+        # Check for stuck levels
+        current_level_sessions = len([s for s in sessions if any(
+            item.item_id == s.item_id and item.difficulty_level == hierarchy.current_level 
+            for item in hierarchy.exposure_items
+        )])
+        if current_level_sessions > 4:
+            patterns.append(f"Multiple attempts at level {hierarchy.current_level} - consider adjusting approach")
+        
+        # Check termination patterns
+        terminations = [s for s in sessions if s.premature_termination]
+        if len(terminations) > len(sessions) * 0.3:
+            patterns.append("Frequent early terminations - review safety plans and coping strategies")
+        
+        return patterns
+
+    def _generate_exposure_recommendations(
+        self, 
+        hierarchy: ExposureHierarchy, 
+        sessions: List[ExposureSession],
+        patterns: List[str]
+    ) -> List[str]:
+        """Generate recommendations for exposure therapy"""
+        recommendations = []
+        
+        # Progress-based recommendations
+        if hierarchy.exposure_items:
+            completion_rate = len(hierarchy.levels_mastered) / len(hierarchy.exposure_items)
+            
+            if completion_rate < 0.3:
+                recommendations.append("Consider starting with easier items or extending session duration")
+            elif completion_rate > 0.7:
+                recommendations.append("Excellent progress! Focus on generalization and maintenance")
+        
+        # Session-based recommendations
+        if sessions:
+            avg_habituation = sum(1 for s in sessions if s.habituation_achieved) / len(sessions)
+            
+            if avg_habituation < 0.5:
+                recommendations.append("Low habituation rate - consider longer sessions or addressing avoidance behaviors")
+            
+            # Anxiety level recommendations
+            recent_sessions = sessions[-3:] if len(sessions) >= 3 else sessions
+            high_baseline = sum(1 for s in recent_sessions if s.baseline_anxiety and s.baseline_anxiety > 7)
+            
+            if high_baseline > len(recent_sessions) * 0.5:
+                recommendations.append("High baseline anxiety - increase between-session practice and relaxation skills")
+        
+        # Pattern-based recommendations
+        if "Limited habituation" in str(patterns):
+            recommendations.append("Consider interoceptive exposure or addressing safety behaviors")
+        
+        if "early terminations" in str(patterns):
+            recommendations.append("Strengthen coping skills training before continuing exposure")
+        
+        # Level-specific recommendations
+        if hierarchy.current_level <= 3:
+            recommendations.append("Focus on building confidence with current level mastery")
+        elif hierarchy.current_level >= 6:
+            recommendations.append("Prepare for real-world generalization and relapse prevention")
+        
+        return recommendations
+
+    # ========================================================================
+    # UTILITY AND CONVENIENCE METHODS
+    # ========================================================================
+
+    def get_next_recommended_exposure(self, patient_id: str) -> Optional[Dict[str, Any]]:
+        """Get next recommended exposure for patient"""
+        hierarchies = self.get_patient_hierarchies(patient_id)
+        
+        if not hierarchies:
+            return None
+        
+        # Find most active hierarchy
+        active_hierarchy = max(hierarchies, key=lambda h: h.total_sessions_completed)
+        
+        # Find appropriate level
+        current_level = active_hierarchy.current_level
+        current_item = None
+        
+        for item in active_hierarchy.exposure_items:
+            if item.difficulty_level == current_level:
+                current_item = item
+                break
+        
+        if not current_item:
+            return None
+        
+        # Check if current level is mastered
+        mastery_criteria = active_hierarchy.mastery_criteria
+        required_completions = mastery_criteria.get('successful_completions_required', 2)
+        
+        if current_item.successful_completions >= required_completions:
+            # Move to next level
+            next_level = min(current_level + 1, 8)
+            for item in active_hierarchy.exposure_items:
+                if item.difficulty_level == next_level:
+                    current_item = item
+                    break
+        
+        return {
+            "hierarchy_id": active_hierarchy.hierarchy_id,
+            "target_fear": active_hierarchy.target_fear,
+            "recommended_item": {
+                "item_id": current_item.item_id,
+                "description": current_item.description,
+                "level": current_item.difficulty_level,
+                "type": current_item.exposure_type.value,
+                "estimated_duration": current_item.estimated_duration,
+                "attempts": current_item.attempts,
+                "success_rate": round((current_item.successful_completions / current_item.attempts * 100) if current_item.attempts > 0 else 0, 1)
+            },
+            "preparation_notes": [
+                "Review hierarchy and session goals",
+                "Practice relaxation techniques",
+                "Prepare any required materials",
+                "Plan post-exposure processing"
+            ]
+        }
+
+    def calculate_exposure_score(self, session: ExposureSession) -> Dict[str, Any]:
+        """Calculate exposure effectiveness score"""
+        if not all([session.baseline_anxiety, session.peak_anxiety, session.end_anxiety]):
+            return {"error": "Incomplete anxiety data"}
+        
+        # Calculate habituation rate
+        habituation_rate = (session.peak_anxiety - session.end_anxiety) / session.peak_anxiety * 100
+        
+        # Calculate approach behavior (completing vs avoiding)
+        approach_score = 0
+        if not session.premature_termination:
+            approach_score += 40
+        if session.habituation_achieved:
+            approach_score += 30
+        if session.actual_duration and session.planned_duration:
+            duration_ratio = session.actual_duration / session.planned_duration
+            approach_score += min(30, duration_ratio * 30)
+        
+        # Calculate overall effectiveness
+        effectiveness = (habituation_rate * 0.6) + (approach_score * 0.4)
+        effectiveness = max(0, min(100, effectiveness))
+        
+        return {
+            "habituation_rate": round(habituation_rate, 1),
+            "approach_score": round(approach_score, 1),
+            "overall_effectiveness": round(effectiveness, 1),
+            "effectiveness_level": (
+                "Excellent" if effectiveness >= 80 else
+                "Good" if effectiveness >= 60 else
+                "Moderate" if effectiveness >= 40 else
+                "Poor"
+            ),
+            "recommendations": self._get_session_recommendations(session, habituation_rate, approach_score)
+        }
+
+    def _get_session_recommendations(self, session: ExposureSession, habituation_rate: float, approach_score: float) -> List[str]:
+        """Get recommendations based on session performance"""
+        recommendations = []
+        
+        if habituation_rate < 30:
+            recommendations.append("Consider longer exposure duration to allow more habituation")
+            recommendations.append("Check for subtle avoidance behaviors during exposure")
+        
+        if approach_score < 50:
+            recommendations.append("Work on increasing willingness to stay in exposure situations")
+            recommendations.append("Strengthen coping skills before next exposure")
+        
+        if session.premature_termination:
+            recommendations.append("Identify triggers for early termination and develop specific coping strategies")
+        
+        if session.peak_anxiety and session.peak_anxiety > 8:
+            recommendations.append("Consider starting with slightly easier exposure or more preparation")
+        
+        if habituation_rate > 70 and approach_score > 70:
+            recommendations.append("Excellent session! Consider progressing to next hierarchy level")
+        
+        return recommendations
+
+    def create_exposure_homework(self, session_id: str) -> Dict[str, Any]:
+        """Create homework assignment based on exposure session"""
+        session = self.get_exposure_session(session_id)
+        if not session:
+            return {"error": "Session not found"}
+        
+        # Get hierarchy context
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT eh.target_fear, ei.description, ei.difficulty_level
+                FROM exposure_sessions es
+                JOIN exposure_items ei ON es.item_id = ei.item_id
+                JOIN exposure_hierarchies eh ON ei.hierarchy_id = eh.hierarchy_id
+                WHERE es.session_id = ?
+            """, (session_id,))
+            
+            result = cursor.fetchone()
+            if not result:
+                return {"error": "Could not find session context"}
+            
+            target_fear, item_description, difficulty_level = result
+        
+        # Create homework based on session outcome
+        if session.habituation_achieved and session.end_anxiety and session.end_anxiety <= 3:
+            # Good session - practice current level
+            homework_type = "reinforcement"
+            homework_tasks = [
+                f"Practice the same exposure: {item_description}",
+                "Aim for similar or longer duration",
+                "Focus on staying present during anxiety peaks",
+                "Record SUDS ratings every 5-10 minutes"
+            ]
+        elif session.habituation_achieved:
+            # Moderate session - repeat with modifications
+            homework_type = "consolidation"
+            homework_tasks = [
+                f"Repeat exposure: {item_description}",
+                "Try to extend duration by 10-15 minutes",
+                "Practice without any safety behaviors",
+                "Notice thoughts and feelings during exposure"
+            ]
+        else:
+            # Difficult session - step back slightly
+            homework_type = "preparation"
+            homework_tasks = [
+                "Practice relaxation techniques daily",
+                f"Brief exposure to easier version of: {item_description}",
+                "Focus on staying in situation until anxiety drops slightly",
+                "Use coping strategies learned in session"
+            ]
+        
+        homework = {
+            "session_id": session_id,
+            "homework_type": homework_type,
+            "target_fear": target_fear,
+            "difficulty_level": difficulty_level,
+            "tasks": homework_tasks,
+            "monitoring_instructions": [
+                "Rate anxiety before, during (peak), and after exposure",
+                "Note any avoidance behaviors or safety behaviors used",
+                "Record duration of exposure",
+                "Write brief notes about thoughts and feelings"
+            ],
+            "success_criteria": [
+                "Complete at least 3 exposure practices",
+                "Achieve some anxiety reduction in each practice",
+                "Avoid early termination due to anxiety",
+                "Use coping skills effectively"
+            ],
+            "emergency_plan": [
+                "If anxiety becomes overwhelming, use grounding techniques",
+                "Remember that anxiety will decrease naturally",
+                "Contact therapist if unable to complete any exposures",
+                "Do not avoid the situation completely"
+            ]
+        }
+        
+        return homework
+
+    def get_hierarchy_completion_status(self, hierarchy_id: str) -> Dict[str, Any]:
+        """Get detailed completion status of hierarchy"""
+        hierarchy = self.get_exposure_hierarchy(hierarchy_id)
+        if not hierarchy:
+            return {"error": "Hierarchy not found"}
+        
+        status = {
+            "hierarchy_id": hierarchy_id,
+            "target_fear": hierarchy.target_fear,
+            "total_levels": len(hierarchy.exposure_items),
+            "current_level": hierarchy.current_level,
+            "levels_mastered": hierarchy.levels_mastered,
+            "mastery_percentage": round(len(hierarchy.levels_mastered) / len(hierarchy.exposure_items) * 100, 1),
+            "next_level": min(hierarchy.current_level + 1, 8) if hierarchy.current_level < 8 else None,
+            "estimated_sessions_remaining": max(0, hierarchy.estimated_completion_date.days - datetime.now().days) if hierarchy.estimated_completion_date else None,
+            "readiness_for_next_level": self._assess_readiness_for_next_level(hierarchy)
+        }
+        
+        return status
+
+    def _assess_readiness_for_next_level(self, hierarchy: ExposureHierarchy) -> Dict[str, Any]:
+        """Assess if patient is ready for next hierarchy level"""
+        current_level = hierarchy.current_level
+        current_item = None
+        
+        for item in hierarchy.exposure_items:
+            if item.difficulty_level == current_level:
+                current_item = item
+                break
+        
+        if not current_item:
+            return {"ready": False, "reason": "Current level item not found"}
+        
+        mastery_criteria = hierarchy.mastery_criteria
+        required_completions = mastery_criteria.get('successful_completions_required', 2)
+        max_end_anxiety = mastery_criteria.get('maximum_end_anxiety', 3)
+        
+        # Check mastery criteria
+        meets_completion_requirement = current_item.successful_completions >= required_completions
+        meets_anxiety_requirement = (current_item.average_end_anxiety is None or 
+                                    current_item.average_end_anxiety <= max_end_anxiety)
+        
+        ready = meets_completion_requirement and meets_anxiety_requirement
+        
+        readiness = {
+            "ready": ready,
+            "current_level": current_level,
+            "successful_completions": current_item.successful_completions,
+            "required_completions": required_completions,
+            "average_end_anxiety": current_item.average_end_anxiety,
+            "max_allowed_end_anxiety": max_end_anxiety,
+            "criteria_met": {
+                "completion_requirement": meets_completion_requirement,
+                "anxiety_requirement": meets_anxiety_requirement
+            }
+        }
+        
+        if not ready:
+            if not meets_completion_requirement:
+                readiness["recommendation"] = f"Need {required_completions - current_item.successful_completions} more successful completions"
+            elif not meets_anxiety_requirement:
+                readiness["recommendation"] = f"Need to reduce end anxiety to {max_end_anxiety} or below"
+        else:
+            readiness["recommendation"] = "Ready to progress to next level"
+        
+        return readiness
